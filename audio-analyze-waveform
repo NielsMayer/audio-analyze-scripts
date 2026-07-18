@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# audio-analyze-waveform — Extract waveform amplitude envelope + spectral centroid
+# Usage: audio-analyze-waveform <mediafile>
+# Output: JSON to stdout
+
+set -euo pipefail
+
+MEDIAFILE="${1:-}"
+if [[ -z "$MEDIAFILE" ]]; then
+    echo "Usage: $0 <mediafile>" >&2
+    exit 1
+fi
+
+POINTS="${WAVEFORM_POINTS:-2000}"
+
+python3 -c "
+import sys, subprocess, json, math
+import numpy as np
+
+mediafile = sys.argv[1]
+points = int(sys.argv[2])
+
+probe = subprocess.run(['ffprobe','-v','quiet','-print_format','json','-show_streams',mediafile], capture_output=True, text=True)
+info = json.loads(probe.stdout)
+audio_stream = next(s for s in info['streams'] if s['codec_type']=='audio')
+sr = int(audio_stream['sample_rate'])
+ch = int(audio_stream['channels'])
+
+pcm = subprocess.run(['ffmpeg','-hide_banner','-v','quiet','-i',mediafile,'-ac','1','-ar',str(sr),'-f','f32le','-'], capture_output=True)
+samples = np.frombuffer(pcm.stdout, dtype=np.float32)
+
+duration = len(samples) / sr
+block_size = max(1, len(samples) // points)
+actual_points = len(samples) // block_size
+
+waveform = []
+for i in range(actual_points):
+    start = i * block_size
+    end = start + block_size
+    block = samples[start:end]
+    t = (start + block_size/2) / sr
+    min_amp = float(np.min(block))
+    max_amp = float(np.max(block))
+    rms = float(np.sqrt(np.mean(block**2)))
+
+    if len(block) >= 256:
+        fft_size = 512
+        if len(block) > fft_size:
+            center = len(block) // 2
+            fft_block = block[center - fft_size//2:center + fft_size//2]
+        else:
+            fft_block = np.pad(block, (0, fft_size - len(block)))
+
+        fft = np.fft.rfft(fft_block)
+        magnitudes = np.abs(fft)
+        freqs = np.fft.rfftfreq(fft_size, 1/sr)
+
+        if np.sum(magnitudes) > 1e-10:
+            centroid = float(np.sum(freqs * magnitudes) / np.sum(magnitudes))
+        else:
+            centroid = 0.0
+
+        low_mask = freqs < 250
+        mid_mask = (freqs >= 250) & (freqs < 4000)
+        high_mask = freqs >= 4000
+        total_energy = np.sum(magnitudes**2) + 1e-10
+        low_ratio = float(np.sum(magnitudes[low_mask]**2) / total_energy)
+        mid_ratio = float(np.sum(magnitudes[mid_mask]**2) / total_energy)
+        high_ratio = float(np.sum(magnitudes[high_mask]**2) / total_energy)
+    else:
+        centroid = 0.0
+        low_ratio = mid_ratio = high_ratio = 1.0/3.0
+
+    waveform.append({
+        'time': round(t, 4),
+        'minAmplitude': round(min_amp, 6),
+        'maxAmplitude': round(max_amp, 6),
+        'rms': round(rms, 6),
+        'spectralCentroidHz': round(centroid, 1),
+        'bandEnergy': {
+            'low': round(low_ratio, 4),
+            'mid': round(mid_ratio, 4),
+            'high': round(high_ratio, 4)
+        }
+    })
+
+result = {
+    'file': mediafile,
+    'durationSeconds': round(duration, 4),
+    'sampleRate': sr,
+    'channels': ch,
+    'points': len(waveform),
+    'waveform': waveform
+}
+
+json.dump(result, sys.stdout, indent=2)
+" "$MEDIAFILE" "$POINTS"

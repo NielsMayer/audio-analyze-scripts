@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# audio-analyze-metadata — Extract comprehensive media metadata
+# Usage: audio-analyze-metadata <mediafile>
+# Output: JSON to stdout
+
+set -euo pipefail
+
+MEDIAFILE="${1:-}"
+if [[ -z "$MEDIAFILE" ]]; then
+    echo "Usage: $0 <mediafile>" >&2
+    exit 1
+fi
+
+BASENAME=$(basename "$MEDIAFILE")
+
+FFPROBE_JSON=$(ffprobe -v quiet -print_format json -show_format -show_streams "$MEDIAFILE")
+
+echo "$FFPROBE_JSON" | jq   --arg path "$MEDIAFILE"   --arg basename "$BASENAME"   '{
+    file: {
+      path: $path,
+      basename: $basename,
+      sizeBytes: (.format.size // "0" | tonumber),
+      durationSeconds: (.format.duration // "0" | tonumber),
+      bitRate: (.format.bit_rate // "0" | tonumber),
+      formatName: (.format.format_name // null),
+      formatLongName: (.format.format_long_name // null),
+      probeScore: (.format.probe_score // null)
+    },
+    audio: [
+      .streams[] | select(.codec_type == "audio") | {
+        index: .index,
+        codecName: (.codec_name // null),
+        codecLongName: (.codec_long_name // null),
+        codecTagString: (.codec_tag_string // null),
+        sampleRate: (.sample_rate // "0" | tonumber),
+        channels: (.channels // "0" | tonumber),
+        channelLayout: (.channel_layout // null),
+        bitsPerSample: (.bits_per_raw_sample // .bits_per_sample // "0" | tonumber),
+        sampleFormat: (.sample_fmt // null),
+        duration: (.duration // "0" | tonumber),
+        bitRate: (.bit_rate // "0" | tonumber),
+        maxBitRate: (.max_bit_rate // "0" | tonumber),
+        nbFrames: (.nb_frames // "0" | tonumber),
+        startTime: (.start_time // "0" | tonumber),
+        tags: (.tags // {})
+      }
+    ],
+    video: [
+      .streams[] | select(.codec_type == "video") | {
+        index: .index,
+        codecName: (.codec_name // null),
+        codecLongName: (.codec_long_name // null),
+        width: .width,
+        height: .height,
+        displayAspectRatio: (.display_aspect_ratio // null),
+        pixelFormat: (.pix_fmt // null),
+        frameRate: (.r_frame_rate // null),
+        avgFrameRate: (.avg_frame_rate // null),
+        nbFrames: (.nb_frames // "0" | tonumber),
+        duration: (.duration // "0" | tonumber),
+        bitRate: (.bit_rate // "0" | tonumber),
+        tags: (.tags // {})
+      }
+    ],
+    subtitles: [
+      .streams[] | select(.codec_type == "subtitle") | {
+        index: .index,
+        codecName: (.codec_name // null),
+        language: (.tags.language // null)
+      }
+    ],
+    chapters: (.chapters // []),
+    formatTags: (.format.tags // {})
+  }'

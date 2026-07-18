@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# audio-analyze-spectrogram — Reassigned spectrogram with log-frequency bins
+# Usage: audio-analyze-spectrogram <mediafile>
+# Output: JSON to stdout
+
+set -euo pipefail
+
+MEDIAFILE="${1:-}"
+if [[ -z "$MEDIAFILE" ]]; then
+    echo "Usage: $0 <mediafile>" >&2
+    exit 1
+fi
+
+N_BINS="${SPECTROGRAM_BINS:-256}"
+N_FRAMES="${SPECTROGRAM_FRAMES:-512}"
+FFT_SIZE="${SPECTROGRAM_FFT:-2048}"
+HOP="${SPECTROGRAM_HOP:-512}"
+
+echo "Computing spectrogram (this may take a moment)..." >&2
+
+python3 -c "
+import sys, subprocess, json, math
+import numpy as np
+
+mediafile = sys.argv[1]
+n_bins = int(sys.argv[2])
+n_frames_target = int(sys.argv[3])
+fft_size = int(sys.argv[4])
+hop = int(sys.argv[5])
+
+probe = subprocess.run(['ffprobe','-v','quiet','-print_format','json','-show_streams',mediafile], capture_output=True, text=True)
+info = json.loads(probe.stdout)
+audio_stream = next(s for s in info['streams'] if s['codec_type']=='audio')
+sr = int(audio_stream['sample_rate'])
+
+pcm = subprocess.run(['ffmpeg','-hide_banner','-v','quiet','-i',mediafile,'-ac','1','-ar',str(sr),'-f','f32le','-'], capture_output=True)
+samples = np.frombuffer(pcm.stdout, dtype=np.float32)
+
+window = np.hanning(fft_size)
+n_frames = min(n_frames_target, (len(samples) - fft_size) // hop + 1)
+if n_frames < 1:
+    n_frames = 1
+
+nyquist = sr / 2
+freq_min = 20.0
+freq_max = nyquist
+log_freqs = np.logspace(np.log10(freq_min), np.log10(freq_max), n_bins)
+
+times = []
+magnitudes = []
+
+for frame_idx in range(n_frames):
+    start = frame_idx * hop
+    end = start + fft_size
+    if end > len(samples):
+        break
+
+    block = samples[start:end] * window[:end-start]
+    if len(block) < fft_size:
+        block = np.pad(block, (0, fft_size - len(block)))
+
+    fft = np.fft.rfft(block, n=fft_size)
+    fft_freqs = np.fft.rfftfreq(fft_size, 1/sr)
+    fft_mags = np.abs(fft)
+
+    valid = fft_freqs > 0
+    log_fft_freqs = np.log10(np.maximum(fft_freqs[valid], 1e-10))
+    log_target_freqs = np.log10(log_freqs)
+
+    interp_mags = np.interp(
+        log_target_freqs,
+        log_fft_freqs,
+        fft_mags[valid],
+        left=0.0,
+        right=0.0
+    )
+
+    db_mags = 20 * np.log10(np.maximum(interp_mags, 1e-6))
+    db_mags = np.maximum(db_mags, -120.0)
+
+    magnitudes.append(db_mags.tolist())
+    times.append(round((start + fft_size/2) / sr, 4))
+
+reassigned = []
+for frame_idx in range(len(magnitudes)):
+    reassigned.append({
+        'time': times[frame_idx],
+        'magnitudes': magnitudes[frame_idx]
+    })
+
+result = {
+    'file': mediafile,
+    'sampleRate': sr,
+    'durationSeconds': round(len(samples) / sr, 4),
+    'fftSize': fft_size,
+    'hopSize': hop,
+    'frequencyBins': n_bins,
+    'timeFrames': len(reassigned),
+    'frequencyRangeHz': [round(freq_min, 1), round(freq_max, 1)],
+    'frequenciesHz': [round(f, 1) for f in log_freqs.tolist()],
+    'timesSeconds': times,
+    'spectrogram': reassigned
+}
+
+json.dump(result, sys.stdout, indent=2)
+" "$MEDIAFILE" "$N_BINS" "$N_FRAMES" "$FFT_SIZE" "$HOP"

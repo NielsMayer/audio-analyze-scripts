@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# audio-analyze — Master script that runs all audio/video analysis pipelines
+# Usage: audio-analyze <mediafile>
+# Outputs: <mediafile>.metadata.json, <mediafile>.loudness.json,
+#          <mediafile>.waveform.json, <mediafile>.spectrogram.json
+#
+# Requires: ffmpeg, ffprobe, python3, numpy, scipy, jq
+
+set -euo pipefail
+
+MEDIAFILE="${1:-}"
+if [[ -z "$MEDIAFILE" ]]; then
+    echo "Usage: $0 <mediafile>" >&2
+    exit 1
+fi
+
+if [[ ! -f "$MEDIAFILE" ]]; then
+    echo "Error: file not found: $MEDIAFILE" >&2
+    exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASENAME="${MEDIAFILE%.*}"
+
+echo "Analyzing: $MEDIAFILE"
+echo "Outputs will be written to: ${BASENAME}.*.json"
+
+"$SCRIPT_DIR/audio-analyze-metadata" "$MEDIAFILE" > "${BASENAME}.metadata.json"
+echo "  ✓ metadata"
+
+"$SCRIPT_DIR/audio-analyze-loudness" "$MEDIAFILE" > "${BASENAME}.loudness.json"
+echo "  ✓ loudness"
+
+"$SCRIPT_DIR/audio-analyze-waveform" "$MEDIAFILE" > "${BASENAME}.waveform.json"
+echo "  ✓ waveform"
+
+"$SCRIPT_DIR/audio-analyze-spectrogram" "$MEDIAFILE" > "${BASENAME}.spectrogram.json"
+echo "  ✓ spectrogram"
+
+echo "Done."

@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# audio-analyze-loudness — EBU R128 loudness analysis
+# Usage: audio-analyze-loudness <mediafile>
+# Output: JSON to stdout
+
+set -euo pipefail
+
+MEDIAFILE="${1:-}"
+if [[ -z "$MEDIAFILE" ]]; then
+    echo "Usage: $0 <mediafile>" >&2
+    exit 1
+fi
+
+BASENAME=$(basename "$MEDIAFILE")
+
+# Pass 1: EBU R128 loudness
+EBU_LOG=$(mktemp)
+trap "rm -f $EBU_LOG" EXIT
+
+ffmpeg -hide_banner -nostats -i "$MEDIAFILE" -af ebur128=peak=true -f null - 2>"$EBU_LOG" || true
+
+# Parse EBU R128 output
+INTEGRATED=$(grep -oP 'Integrated loudness:\s*\K-?[0-9]+\.[0-9]+' "$EBU_LOG" | head -1 || echo "null")
+LRA=$(grep -oP 'Loudness range:\s*\K[0-9]+\.[0-9]+' "$EBU_LOG" | head -1 || echo "null")
+TRUE_PEAK=$(grep -oP 'True peak:\s*\K-?[0-9]+\.[0-9]+' "$EBU_LOG" | head -1 || echo "null")
+SAMPLE_PEAK=$(grep -oP 'Sample peak:\s*\K-?[0-9]+\.[0-9]+' "$EBU_LOG" | head -1 || echo "null")
+
+# Pass 2: RMS using volumedetect
+RMS_LOG=$(mktemp)
+trap "rm -f $RMS_LOG $EBU_LOG" EXIT
+
+ffmpeg -hide_banner -nostats -i "$MEDIAFILE" -af volumedetect -f null - 2>"$RMS_LOG" || true
+
+MEAN_VOLUME=$(grep -oP 'mean_volume: \K-?[0-9]+\.[0-9]+' "$RMS_LOG" | head -1 || echo "null")
+MAX_VOLUME=$(grep -oP 'max_volume: \K-?[0-9]+\.[0-9]+' "$RMS_LOG" | head -1 || echo "null")
+
+# Compute momentary/short-term via Python, and assemble final JSON in one go
+python3 -c "
+import sys, subprocess, json, math
+import numpy as np
+
+mediafile = sys.argv[1]
+basename = sys.argv[2]
+integrated = sys.argv[3] if sys.argv[3] != 'null' else None
+lra = sys.argv[4] if sys.argv[4] != 'null' else None
+true_peak = sys.argv[5] if sys.argv[5] != 'null' else None
+sample_peak = sys.argv[6] if sys.argv[6] != 'null' else None
+mean_volume = sys.argv[7] if sys.argv[7] != 'null' else None
+max_volume = sys.argv[8] if sys.argv[8] != 'null' else None
+
+# Convert mean_volume dB to linear RMS
+rms_linear = None
+if mean_volume is not None:
+    rms_linear = 10**(float(mean_volume)/20)
+
+# Extract raw audio for momentary/short-term analysis
+probe = subprocess.run(['ffprobe','-v','quiet','-print_format','json','-show_streams',mediafile], capture_output=True, text=True)
+info = json.loads(probe.stdout)
+audio_stream = next(s for s in info['streams'] if s['codec_type']=='audio')
+sr = int(audio_stream['sample_rate'])
+
+pcm = subprocess.run(['ffmpeg','-hide_banner','-v','quiet','-i',mediafile,'-ac','1','-ar',str(sr),'-f','f32le','-'], capture_output=True)
+samples = np.frombuffer(pcm.stdout, dtype=np.float32)
+
+def lufs_block(samples, sr, block_s, step_s):
+    block_n = int(block_s * sr)
+    step_n = int(step_s * sr)
+    values = []
+    for i in range(0, len(samples) - block_n + 1, step_n):
+        block = samples[i:i+block_n]
+        ms = np.mean(block**2)
+        if ms > 1e-10:
+            lufs = -0.691 + 10*math.log10(ms)
+            values.append(float(lufs))
+    return values
+
+momentary = lufs_block(samples, sr, 0.4, 0.1)
+shortterm = lufs_block(samples, sr, 3.0, 1.5)
+
+result = {
+    'file': basename,
+    'path': mediafile,
+    'global': {
+        'integratedLUFS': float(integrated) if integrated else None,
+        'loudnessRangeLU': float(lra) if lra else None,
+        'truePeakDBTP': float(true_peak) if true_peak else None,
+        'samplePeakDB': float(sample_peak) if sample_peak else None,
+        'rmsDB': float(mean_volume) if mean_volume else None,
+        'rmsLinear': rms_linear,
+        'maxVolumeDB': float(max_volume) if max_volume else None,
+    },
+    'momentaryLUFS': {
+        'values': momentary[:2000] if len(momentary) > 2000 else momentary,
+        'mean': float(np.mean(momentary)) if momentary else None,
+        'max': float(np.max(momentary)) if momentary else None,
+        'min': float(np.min(momentary)) if momentary else None,
+    },
+    'shortTermLUFS': {
+        'values': shortterm[:500] if len(shortterm) > 500 else shortterm,
+        'mean': float(np.mean(shortterm)) if shortterm else None,
+        'max': float(np.max(shortterm)) if shortterm else None,
+        'min': float(np.min(shortterm)) if shortterm else None,
+    }
+}
+
+json.dump(result, sys.stdout, indent=2)
+" "$MEDIAFILE" "$BASENAME" "$INTEGRATED" "$LRA" "$TRUE_PEAK" "$SAMPLE_PEAK" "$MEAN_VOLUME" "$MAX_VOLUME"
