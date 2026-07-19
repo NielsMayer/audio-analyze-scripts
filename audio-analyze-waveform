@@ -26,8 +26,33 @@ audio_stream = next(s for s in info['streams'] if s['codec_type']=='audio')
 sr = int(audio_stream['sample_rate'])
 ch = int(audio_stream['channels'])
 
-pcm = subprocess.run(['ffmpeg','-hide_banner','-v','quiet','-i',mediafile,'-ac','1','-ar',str(sr),'-f','f32le','-'], capture_output=True)
+# Robust audio extraction
+pcm = subprocess.run([
+    'ffmpeg','-hide_banner','-v','quiet',
+    '-i',mediafile,
+    '-map','0:a:0',
+    '-af','aresample=async=1:first_pts=0,aformat=sample_fmts=flt,pan=mono|c0=0.5*c0+0.5*c1',
+    '-ar',str(sr),
+    '-f','f32le','-'
+], capture_output=True)
+
 samples = np.frombuffer(pcm.stdout, dtype=np.float32)
+
+# Fallback if silent
+if len(samples) == 0 or np.max(np.abs(samples)) < 1e-10:
+    pcm2 = subprocess.run([
+        'ffmpeg','-hide_banner','-v','quiet',
+        '-i',mediafile,
+        '-map','0:a:0',
+        '-ac','1',
+        '-ar',str(sr),
+        '-f','f32le','-'
+    ], capture_output=True)
+    samples = np.frombuffer(pcm2.stdout, dtype=np.float32)
+
+if len(samples) == 0:
+    print('Error: no audio extracted', file=sys.stderr)
+    sys.exit(1)
 
 duration = len(samples) / sr
 block_size = max(1, len(samples) // points)
