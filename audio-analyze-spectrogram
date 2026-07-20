@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# audio-analyze-spectrogram — Reassigned spectrogram with log-frequency bins
+# audio-analyze-spectrogram — Log-frequency spectrogram
 # Usage: audio-analyze-spectrogram <mediafile>
 # Output: JSON to stdout
 
@@ -19,8 +19,9 @@ HOP="${SPECTROGRAM_HOP:-512}"
 echo "Computing spectrogram (this may take a moment)..." >&2
 
 python3 -c "
-import sys, subprocess, json, math, struct
+import sys, subprocess, json, math
 import numpy as np
+from scipy import signal
 
 mediafile = sys.argv[1]
 n_bins = int(sys.argv[2])
@@ -33,15 +34,14 @@ probe = subprocess.run(['ffprobe','-v','quiet','-print_format','json','-show_str
 info = json.loads(probe.stdout)
 audio_stream = next(s for s in info['streams'] if s['codec_type']=='audio')
 sr = int(audio_stream['sample_rate'])
-ch = int(audio_stream['channels'])
 
-# Extract audio: explicitly map audio stream, convert to mono float32
-# Use aformat to ensure flt, aresample for high-quality mono downmix
+# Extract audio: mono float32
 pcm = subprocess.run([
     'ffmpeg','-hide_banner','-v','quiet',
     '-i',mediafile,
     '-map','0:a:0',
-    '-af','aresample=async=1:first_pts=0,aformat=sample_fmts=flt,pan=mono|c0=0.5*c0+0.5*c1',
+    '-ac','1',
+    '-af','aresample=async=1:first_pts=0,aformat=sample_fmts=flt',
     '-ar',str(sr),
     '-f','f32le','-'
 ], capture_output=True)
@@ -51,79 +51,66 @@ if len(pcm.stdout) == 0:
     sys.exit(1)
 
 samples = np.frombuffer(pcm.stdout, dtype=np.float32)
+peak = np.max(np.abs(samples))
+print(f'Extracted {len(samples)} samples, peak amplitude {peak:.6f}', file=sys.stderr)
 
-# Sanity check: if all zeros or all same value, something went wrong
-if np.all(samples == 0) or np.max(np.abs(samples)) < 1e-10:
-    print('Warning: extracted audio is silent or near-silent', file=sys.stderr)
-    # Try alternative extraction without pan filter
-    pcm2 = subprocess.run([
-        'ffmpeg','-hide_banner','-v','quiet',
-        '-i',mediafile,
-        '-map','0:a:0',
-        '-ac','1',
-        '-ar',str(sr),
-        '-f','f32le','-'
-    ], capture_output=True)
-    samples = np.frombuffer(pcm2.stdout, dtype=np.float32)
-    if len(samples) > 0 and np.max(np.abs(samples)) > 1e-10:
-        print('Alternative extraction succeeded', file=sys.stderr)
-    else:
-        print('Error: could not extract valid audio', file=sys.stderr)
-        sys.exit(1)
+if peak < 1e-10:
+    print('Error: extracted audio is silent', file=sys.stderr)
+    sys.exit(1)
 
-print(f'Extracted {len(samples)} samples, max amplitude {np.max(np.abs(samples)):.6f}', file=sys.stderr)
+# Compute spectrogram using scipy (properly normalized STFT)
+# scaling='spectrum', mode='magnitude' gives the magnitude spectrum
+# For a sine wave of amplitude A at an FFT bin center, peak magnitude = A/2
+# We multiply by 2 to get amplitude relative to full scale
+freqs, times_s, Sxx = signal.spectrogram(
+    samples, sr,
+    nperseg=fft_size,
+    noverlap=fft_size - hop,
+    window='hann',
+    scaling='spectrum',
+    mode='magnitude'
+)
 
-window = np.hanning(fft_size)
-n_frames = min(n_frames_target, max(1, (len(samples) - fft_size) // hop + 1))
+# Correct for scipy's normalization (peak of sine wave = amplitude/2)
+Sxx = Sxx * 2
 
-nyquist = sr / 2
+# Limit to target number of frames
+if len(times_s) > n_frames_target:
+    Sxx = Sxx[:, :n_frames_target]
+    times_s = times_s[:n_frames_target]
+
+# Create log-spaced frequency bins
+nyquist = sr / 2.0
 freq_min = 20.0
 freq_max = nyquist
 log_freqs = np.logspace(np.log10(freq_min), np.log10(freq_max), n_bins)
 
-times = []
-magnitudes = []
-
-for frame_idx in range(n_frames):
-    start = frame_idx * hop
-    end = start + fft_size
-    if end > len(samples):
-        break
-
-    block = samples[start:end]
-    # Apply window
-    block = block * window[:len(block)]
-    if len(block) < fft_size:
-        block = np.pad(block, (0, fft_size - len(block)))
-
-    fft = np.fft.rfft(block, n=fft_size)
-    fft_freqs = np.fft.rfftfreq(fft_size, 1/sr)
-    fft_mags = np.abs(fft)
-
-    valid = fft_freqs > 0
-    log_fft_freqs = np.log10(np.maximum(fft_freqs[valid], 1e-10))
-    log_target_freqs = np.log10(log_freqs)
-
-    interp_mags = np.interp(
-        log_target_freqs,
-        log_fft_freqs,
-        fft_mags[valid],
-        left=0.0,
-        right=0.0
+# Interpolate spectrogram to log-frequency bins
+# scipy spectrogram already has energy across all bins due to windowing,
+# so interpolation works correctly (unlike raw FFT magnitude interpolation)
+log_spec = np.zeros((n_bins, len(times_s)))
+for i in range(len(times_s)):
+    log_spec[:, i] = np.interp(
+        log_freqs,
+        freqs,
+        Sxx[:, i],
+        left=Sxx[0, i],
+        right=Sxx[-1, i]
     )
 
-    # Convert to dB (clamp at -120 dB)
-    db_mags = 20 * np.log10(np.maximum(interp_mags, 1e-6))
-    db_mags = np.maximum(db_mags, -120.0)
+# Convert to dB (reference = 1.0 = 0 dBFS)
+db_spec = 20.0 * np.log10(np.maximum(log_spec, 1e-12))
+db_spec = np.maximum(db_spec, -140.0)
 
-    magnitudes.append(db_mags.tolist())
-    times.append(round((start + fft_size/2) / sr, 4))
+# Debug stats
+print(f'Spectrogram shape: {db_spec.shape}, dB range: {np.min(db_spec):.1f} to {np.max(db_spec):.1f}', file=sys.stderr)
 
+# Build output
 reassigned = []
-for frame_idx in range(len(magnitudes)):
+for i in range(len(times_s)):
     reassigned.append({
-        'time': times[frame_idx],
-        'magnitudes': magnitudes[frame_idx]
+        'time': round(float(times_s[i]), 4),
+        'magnitudes': db_spec[:, i].tolist()
     })
 
 result = {
@@ -135,8 +122,8 @@ result = {
     'frequencyBins': n_bins,
     'timeFrames': len(reassigned),
     'frequencyRangeHz': [round(freq_min, 1), round(freq_max, 1)],
-    'frequenciesHz': [round(f, 1) for f in log_freqs.tolist()],
-    'timesSeconds': times,
+    'frequenciesHz': [round(float(f), 1) for f in log_freqs.tolist()],
+    'timesSeconds': [round(float(t), 4) for t in times_s.tolist()],
     'spectrogram': reassigned
 }
 
