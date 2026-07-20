@@ -1,0 +1,11 @@
+from scipy import signal
+
+# Compute STFT
+f, t, Zxx = signal.stft(samples, sr, nperseg=fft_size, noverlap=fft_size-hop, 
+                        window='hann', scaling='spectrum')
+
+# Zxx is complex, magnitude is |Zxx|
+# For scaling='spectrum', |Zxx|^2 gives power spectrum
+# For amplitude: np.abs(Zxx)
+
+# Then interpolate f (linear) to log_freqs
